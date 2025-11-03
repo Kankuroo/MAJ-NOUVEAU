@@ -100,6 +100,11 @@ CREATE TABLE IF NOT EXISTS salary_profiles (
     malus REAL DEFAULT 0,
     FOREIGN KEY(employee_id) REFERENCES employees(id) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS employee_schedules (
+    employee_id INTEGER PRIMARY KEY,
+    schedule_json TEXT NOT NULL,
+    FOREIGN KEY(employee_id) REFERENCES employees(id) ON DELETE CASCADE
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -109,6 +114,55 @@ DEFAULT_SETTINGS = {
     "admin_password": "",
     "late_penalty_amount": "0"
 }
+
+WEEKDAY_DATA = [
+    ("Mon", "Lun", "Lundi"),
+    ("Tue", "Mar", "Mardi"),
+    ("Wed", "Mer", "Mercredi"),
+    ("Thu", "Jeu", "Jeudi"),
+    ("Fri", "Ven", "Vendredi"),
+    ("Sat", "Sam", "Samedi"),
+    ("Sun", "Dim", "Dimanche"),
+]
+WEEKDAY_KEYS = [item[0] for item in WEEKDAY_DATA]
+WEEKDAY_SHORT = {item[0]: item[1] for item in WEEKDAY_DATA}
+WEEKDAY_FULL = {item[0]: item[2] for item in WEEKDAY_DATA}
+
+
+def weekday_key(d: date) -> str:
+    return WEEKDAY_KEYS[d.weekday() % len(WEEKDAY_KEYS)]
+
+
+def compute_absence_and_late(
+    am_expected: bool,
+    pm_expected: bool,
+    am_status: Optional[str],
+    pm_status: Optional[str],
+) -> Tuple[float, int]:
+    """Calcule les unités d'absence et le nombre de retards pour un créneau donné."""
+
+    am_val = (am_status or "none").lower()
+    pm_val = (pm_status or "none").lower()
+
+    abs_units = 0.0
+    late_count = 0
+
+    if am_expected:
+        if am_val == "absent":
+            abs_units += 0.5
+        elif am_val == "late":
+            late_count += 1
+
+    if pm_expected:
+        if pm_val == "absent":
+            abs_units += 0.5
+
+    # Si la journée devait être complète mais que l'après-midi n'a pas été renseigné,
+    # on considère l'absence du matin comme une journée entière.
+    if am_expected and pm_expected and am_val == "absent" and pm_val == "none":
+        abs_units += 0.5
+
+    return abs_units, late_count
 
 class DB:
     def __init__(self, path: str = DB_PATH):
@@ -273,6 +327,153 @@ class DB:
         cur = self.conn.execute("SELECT employee_id, base_salary, bonus, malus FROM salary_profiles")
         return {row["employee_id"]: row for row in cur}
 
+    # work schedules
+    def _coerce_segment(self, entry) -> Optional[dict]:
+        if isinstance(entry, dict):
+            am_val = entry.get("am")
+            if am_val is None:
+                am_val = entry.get("morning")
+            if am_val is None:
+                am_val = entry.get("matin")
+            pm_val = entry.get("pm")
+            if pm_val is None:
+                pm_val = entry.get("afternoon")
+            if pm_val is None:
+                pm_val = entry.get("apres_midi")
+            return {"am": bool(am_val), "pm": bool(pm_val)}
+        if isinstance(entry, (list, tuple)):
+            am_val = entry[0] if len(entry) > 0 else False
+            pm_val = entry[1] if len(entry) > 1 else False
+            return {"am": bool(am_val), "pm": bool(pm_val)}
+        if isinstance(entry, bool):
+            return {"am": bool(entry), "pm": bool(entry)}
+        return None
+
+    def _normalize_schedule_payload(self, data) -> dict:
+        normalized = {}
+        if isinstance(data, dict):
+            for key, entry in data.items():
+                canonical = None
+                for wk in WEEKDAY_KEYS:
+                    if key.lower() == wk.lower():
+                        canonical = wk
+                        break
+                if canonical is None:
+                    continue
+                segment = self._coerce_segment(entry)
+                if segment is not None:
+                    normalized[canonical] = {
+                        "am": bool(segment.get("am")),
+                        "pm": bool(segment.get("pm")),
+                    }
+        return normalized
+
+    def _clone_schedule(self, schedule: dict) -> dict:
+        return {
+            key: {"am": bool(values.get("am")), "pm": bool(values.get("pm"))}
+            for key, values in schedule.items()
+            if key in WEEKDAY_KEYS
+        }
+
+    def _complete_schedule(self, partial: dict) -> dict:
+        base = self.default_week_schedule()
+        completed = self._clone_schedule(base)
+        for key, values in partial.items():
+            if key in completed:
+                completed[key] = {
+                    "am": bool(values.get("am")),
+                    "pm": bool(values.get("pm")),
+                }
+        return completed
+
+    def default_week_schedule(self) -> dict:
+        workdays = (self.get("workdays", DEFAULT_SETTINGS["workdays"]) or DEFAULT_SETTINGS["workdays"]).split(",")
+        workset = {item.strip() for item in workdays if item.strip()}
+        return {
+            key: {"am": key in workset, "pm": key in workset}
+            for key in WEEKDAY_KEYS
+        }
+
+    def employee_custom_schedule(self, employee_id: int) -> dict:
+        row = self.conn.execute(
+            "SELECT schedule_json FROM employee_schedules WHERE employee_id=?",
+            (employee_id,),
+        ).fetchone()
+        if not row or not row[0]:
+            return {}
+        try:
+            payload = json.loads(row[0])
+        except Exception:
+            return {}
+        return self._normalize_schedule_payload(payload)
+
+    def get_effective_schedule(self, employee_id: int) -> dict:
+        custom = self.employee_custom_schedule(employee_id)
+        if not custom:
+            return self.default_week_schedule()
+        return self._complete_schedule(custom)
+
+    def set_employee_schedule(self, employee_id: int, schedule: dict):
+        normalized = self._normalize_schedule_payload(schedule)
+        completed = self._complete_schedule(normalized)
+        default = self.default_week_schedule()
+        if completed == default:
+            self.clear_employee_schedule(employee_id)
+            return
+        self.conn.execute(
+            "REPLACE INTO employee_schedules(employee_id, schedule_json) VALUES(?,?)",
+            (employee_id, json.dumps(completed)),
+        )
+        self.conn.commit()
+
+    def clear_employee_schedule(self, employee_id: int):
+        self.conn.execute("DELETE FROM employee_schedules WHERE employee_id=?", (employee_id,))
+        self.conn.commit()
+
+    def employee_has_custom_schedule(self, employee_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM employee_schedules WHERE employee_id=?",
+            (employee_id,),
+        ).fetchone()
+        return row is not None
+
+    def custom_schedule_employee_ids(self) -> set:
+        cur = self.conn.execute("SELECT employee_id FROM employee_schedules")
+        return {int(row[0]) for row in cur}
+
+    def fetch_effective_schedules(self) -> dict:
+        default = self.default_week_schedule()
+        cur = self.conn.execute("SELECT employee_id, schedule_json FROM employee_schedules")
+        customs = {}
+        for row in cur:
+            emp_id = int(row[0])
+            try:
+                payload = json.loads(row[1]) if row[1] else {}
+            except Exception:
+                payload = {}
+            customs[emp_id] = self._complete_schedule(self._normalize_schedule_payload(payload))
+
+        schedules = {}
+        default_clone = self._clone_schedule(default)
+        for emp in self.employees():
+            emp_id = int(emp["id"])
+            if emp_id in customs:
+                schedules[emp_id] = self._clone_schedule(customs[emp_id])
+            else:
+                schedules[emp_id] = self._clone_schedule(default_clone)
+        return schedules
+
+    def day_segments_for(self, employee_id: int, d: date, schedules: Optional[dict] = None) -> dict:
+        schedule_map = schedules or {}
+        schedule = schedule_map.get(employee_id)
+        if schedule is None:
+            schedule = self.get_effective_schedule(employee_id)
+        day_cfg = schedule.get(weekday_key(d), {"am": False, "pm": False})
+        return {
+            "am": bool(day_cfg.get("am")),
+            "pm": bool(day_cfg.get("pm")),
+        }
+
     # attendance
     def ensure_day(self, d: date):
         emps = self.employees()
@@ -355,20 +556,26 @@ class EmployeesWin(tk.Toplevel):
     def build(self):
         top = ttk.Frame(self)
         top.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.tree = ttk.Treeview(top, columns=("name",), show="headings", height=14)
+        self.tree = ttk.Treeview(top, columns=("name", "schedule"), show="headings", height=14)
         self.tree.heading("name", text="Nom")
+        self.tree.heading("schedule", text="Planning")
+        self.tree.column("name", width=260, anchor="w")
+        self.tree.column("schedule", width=200, anchor="w")
         self.tree.pack(fill=tk.BOTH, expand=True)
         btns = ttk.Frame(self)
         btns.pack(fill=tk.X, padx=10, pady=8)
         ttk.Button(btns, text="Ajouter", command=self.add_emp).pack(side=tk.LEFT)
         ttk.Button(btns, text="Renommer", command=self.rename_emp).pack(side=tk.LEFT, padx=6)
         ttk.Button(btns, text="Supprimer", command=self.del_emp).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Configurer", command=self.configure_emp).pack(side=tk.LEFT, padx=6)
 
     def refresh(self):
         for i in self.tree.get_children():
             self.tree.delete(i)
+        custom_ids = self.db.custom_schedule_employee_ids()
         for r in self.db.employees():
-            self.tree.insert('', 'end', iid=r['id'], values=(r['name'],))
+            schedule_label = "Personnalisé" if r['id'] in custom_ids else "Par défaut"
+            self.tree.insert('', 'end', iid=r['id'], values=(r['name'], schedule_label))
 
     def add_emp(self):
         name = simpledialog.askstring("Ajouter", "Nom de l'employé :", parent=self)
@@ -401,6 +608,144 @@ class EmployeesWin(tk.Toplevel):
         if messagebox.askyesno("Confirmer", "Supprimer cet employé ?"):
             self.db.delete_employee(emp_id)
             self.refresh()
+
+    def configure_emp(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Configurer", "Veuillez sélectionner un employé.")
+            return
+        emp_id = int(sel[0])
+        values = self.tree.item(sel[0], 'values')
+        name = values[0] if values else ""
+        EmployeeScheduleDialog(self, self.db, emp_id, name, on_saved=self.refresh)
+
+
+class EmployeeScheduleDialog(tk.Toplevel):
+    def __init__(self, master, db: DB, employee_id: int, employee_name: str, on_saved=None):
+        tk.Toplevel.__init__(self, master)
+        self.db = db
+        self.employee_id = employee_id
+        self.employee_name = employee_name or ""
+        self.on_saved = on_saved or (lambda: None)
+        self.title(f"Planning — {self.employee_name}" if self.employee_name else "Planning personnalisé")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.vars = {
+            key: {
+                "am": tk.BooleanVar(value=False),
+                "pm": tk.BooleanVar(value=False),
+            }
+            for key in WEEKDAY_KEYS
+        }
+        self.default_labels = {}
+        self.status_var = tk.StringVar()
+
+        self._build()
+        self._load_schedule()
+
+    def _build(self):
+        header = ttk.Frame(self, padding=12)
+        header.pack(fill=tk.BOTH)
+        ttk.Label(
+            header,
+            text=f"Configurer les jours de travail de {self.employee_name}" if self.employee_name else "Configurer le planning",
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor='w')
+        ttk.Label(
+            header,
+            text="Les cases cochées remplacent les paramètres globaux définis dans Paramètres > Jours & Heures.",
+            wraplength=420,
+            justify="left",
+        ).pack(anchor='w', pady=(6, 0))
+
+        table = ttk.Frame(self, padding=(12, 0))
+        table.pack(fill=tk.BOTH, expand=True)
+        table.grid_columnconfigure(0, weight=1, minsize=140)
+        table.grid_columnconfigure(1, weight=1)
+        table.grid_columnconfigure(2, weight=1)
+        table.grid_columnconfigure(3, weight=1)
+
+        ttk.Label(table, text="Jour", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, padx=4, pady=(0, 6), sticky='w')
+        ttk.Label(table, text="Matin", font=("Segoe UI", 10, "bold")).grid(row=0, column=1, padx=4, pady=(0, 6))
+        ttk.Label(table, text="Après-midi", font=("Segoe UI", 10, "bold")).grid(row=0, column=2, padx=4, pady=(0, 6))
+        ttk.Label(table, text="Par défaut", font=("Segoe UI", 10, "bold")).grid(row=0, column=3, padx=4, pady=(0, 6))
+
+        for idx, key in enumerate(WEEKDAY_KEYS, start=1):
+            ttk.Label(table, text=WEEKDAY_FULL[key]).grid(row=idx, column=0, padx=4, pady=4, sticky='w')
+            ttk.Checkbutton(table, variable=self.vars[key]["am"]).grid(row=idx, column=1, padx=4)
+            ttk.Checkbutton(table, variable=self.vars[key]["pm"]).grid(row=idx, column=2, padx=4)
+            lbl = ttk.Label(table, text="")
+            lbl.grid(row=idx, column=3, padx=4, pady=4, sticky='w')
+            self.default_labels[key] = lbl
+
+        status = ttk.Frame(self, padding=(12, 8))
+        status.pack(fill=tk.BOTH)
+        ttk.Label(status, textvariable=self.status_var, foreground="#0066CC").pack(anchor='w')
+
+        btns = ttk.Frame(self, padding=12)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="Revenir au planning global", command=self.reset_to_default).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Enregistrer", command=self.save).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Fermer", command=self.close).pack(side=tk.RIGHT, padx=(0, 6))
+
+    def _format_segment(self, segment: dict) -> str:
+        am = bool(segment.get("am"))
+        pm = bool(segment.get("pm"))
+        if am and pm:
+            return "Complet"
+        if am and not pm:
+            return "Matin"
+        if pm and not am:
+            return "Après-midi"
+        return "Repos"
+
+    def _load_schedule(self):
+        default = self.db.default_week_schedule()
+        effective = self.db.get_effective_schedule(self.employee_id)
+        has_custom = self.db.employee_has_custom_schedule(self.employee_id)
+        for key in WEEKDAY_KEYS:
+            seg = effective.get(key, {"am": False, "pm": False})
+            self.vars[key]["am"].set(bool(seg.get("am")))
+            self.vars[key]["pm"].set(bool(seg.get("pm")))
+            default_seg = default.get(key, {"am": False, "pm": False})
+            if key in self.default_labels:
+                self.default_labels[key].config(text=self._format_segment(default_seg))
+        self.status_var.set("Planning personnalisé actif" if has_custom else "Planning global utilisé")
+
+    def reset_to_default(self):
+        default = self.db.default_week_schedule()
+        for key in WEEKDAY_KEYS:
+            seg = default.get(key, {"am": False, "pm": False})
+            self.vars[key]["am"].set(bool(seg.get("am")))
+            self.vars[key]["pm"].set(bool(seg.get("pm")))
+        self.status_var.set("Planning global (non enregistré)")
+
+    def save(self):
+        schedule = {
+            key: {"am": self.vars[key]["am"].get(), "pm": self.vars[key]["pm"].get()}
+            for key in WEEKDAY_KEYS
+        }
+        try:
+            self.db.set_employee_schedule(self.employee_id, schedule)
+        except Exception as exc:
+            messagebox.showerror("Erreur", f"Impossible d'enregistrer le planning : {exc}")
+            return
+        if callable(self.on_saved):
+            self.on_saved()
+        has_custom = self.db.employee_has_custom_schedule(self.employee_id)
+        self.status_var.set("Planning personnalisé actif" if has_custom else "Planning global utilisé")
+        messagebox.showinfo("OK", "Planning mis à jour")
+        self.close()
+
+    def close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
 
 # ---------- Présence (tableau aligné, sans clignotement) ----------
 class PresenceWin(tk.Toplevel):
@@ -470,28 +815,44 @@ class PresenceWin(tk.Toplevel):
         arrival = self.db.get("arrival_time", DEFAULT_SETTINGS["arrival_time"]) or "08:00"
         arrival_t = datetime.strptime(arrival, "%H:%M").time()
         show_pm = (self.db.get_halfday_flag(self.current_date) == 1)  # PM visible uniquement après activation
+        schedules = self.db.fetch_effective_schedules()
 
         for idx, r in enumerate(rows, start=1):
+            segments = self.db.day_segments_for(r['employee_id'], self.current_date, schedules)
+            am_expected = segments['am']
+            pm_expected = segments['pm']
             # Col 0: Nom
             ttk.Label(self.rows_frame, text=r['name']).grid(row=idx, column=0, padx=8, pady=4, sticky='w')
 
             # Col 1: Matin (deux boutons indépendants)
             am_frame = ttk.Frame(self.rows_frame)
             am_frame.grid(row=idx, column=1, padx=8, pady=4, sticky='w')
-            ttk.Button(am_frame, text="Présent", command=self._mk_am_present(r, arrival_t)).pack(side=tk.LEFT)
-            ttk.Button(am_frame, text="Absent", command=self._mk_am_absent(r)).pack(side=tk.LEFT, padx=(12,0))
+            if am_expected:
+                ttk.Button(am_frame, text="Présent", command=self._mk_am_present(r, arrival_t)).pack(side=tk.LEFT)
+                ttk.Button(am_frame, text="Absent", command=self._mk_am_absent(r)).pack(side=tk.LEFT, padx=(12,0))
+            else:
+                ttk.Label(am_frame, text="Repos").pack(side=tk.LEFT)
 
             # Col 2: Après‑midi (visible seulement si demi‑journée activée)
             pm_frame = ttk.Frame(self.rows_frame)
             pm_frame.grid(row=idx, column=2, padx=8, pady=4, sticky='w')
             if show_pm:
-                if r['am_status'] == 'absent':
-                    ttk.Button(pm_frame, text="Présent (PM)", command=self._mk_pm_present_after_am_abs(r)).pack(side=tk.LEFT)
-                if r['am_status'] in ('present','late'):
-                    ttk.Button(pm_frame, text="Absent (PM)", command=self._mk_pm_absent_after_am_pres(r)).pack(side=tk.LEFT)
+                if pm_expected:
+                    if am_expected:
+                        if r['am_status'] == 'absent':
+                            ttk.Button(pm_frame, text="Présent (PM)", command=self._mk_pm_present_after_am_abs(r)).pack(side=tk.LEFT)
+                        if r['am_status'] in ('present', 'late'):
+                            ttk.Button(pm_frame, text="Absent (PM)", command=self._mk_pm_absent_after_am_pres(r)).pack(side=tk.LEFT)
+                    else:
+                        ttk.Button(pm_frame, text="Présent (PM)", command=self._mk_pm_present_after_am_abs(r)).pack(side=tk.LEFT)
+                        ttk.Button(pm_frame, text="Absent (PM)", command=self._mk_pm_absent_after_am_pres(r)).pack(side=tk.LEFT, padx=(12,0))
+                else:
+                    ttk.Label(pm_frame, text="Repos").pack(side=tk.LEFT)
+            elif pm_expected and not am_expected:
+                ttk.Label(pm_frame, text="PM prévu").pack(side=tk.LEFT)
 
             # Col 3: Statut
-            statut_txt, color = self.compute_status_text(r)
+            statut_txt, color = self.compute_status_text(r, am_expected, pm_expected)
             lbl = ttk.Label(self.rows_frame, text=statut_txt)
             try:
                 lbl.configure(foreground=color)
@@ -537,19 +898,48 @@ class PresenceWin(tk.Toplevel):
             self.render_rows()
         return _cb
 
-    def compute_status_text(self, r: sqlite3.Row) -> Tuple[str, str]:
-        if r['am_status'] in ('present', 'late') and (not r['pm_status'] or r['pm_status'] == 'none'):
-            return ("En retard", 'orange') if r['am_status'] == 'late' else ("Présent", 'green')
-        if r['am_status'] == 'absent' and (not r['pm_status'] or r['pm_status'] == 'none'):
-            return ("Absent", 'red')
-        if r['am_status'] == 'absent' and r['pm_status'] == 'present':
-            return ("½ journée d'absence", 'red')
-        if r['am_status'] in ('present','late') and r['pm_status'] == 'absent':
-            return ("½ journée d'absence", 'red')
-        if r['am_status'] in ('present','late') and r['pm_status'] in ('present','late'):
-            return ("Présent", 'green')
-        if r['am_status'] == 'absent' and r['pm_status'] == 'absent':
-            return ("Absent", 'red')
+    def compute_status_text(self, r: sqlite3.Row, am_expected: bool, pm_expected: bool) -> Tuple[str, str]:
+        am = (r['am_status'] or 'none').lower()
+        pm = (r['pm_status'] or 'none').lower()
+
+        if not am_expected and not pm_expected:
+            return ("Repos", 'gray')
+
+        if am_expected and pm_expected:
+            if am in ('present', 'late') and pm in ('present', 'late'):
+                return ("En retard", 'orange') if am == 'late' else ("Présent", 'green')
+            if am in ('present', 'late') and pm == 'absent':
+                return ("½ journée d'absence", 'red')
+            if am == 'absent' and pm in ('present', 'late'):
+                return ("½ journée d'absence", 'red')
+            if am == 'absent' and pm == 'absent':
+                return ("Absent", 'red')
+            if am in ('present', 'late') and pm == 'none':
+                return ("En retard", 'orange') if am == 'late' else ("Présent", 'green')
+            if am == 'absent' and pm == 'none':
+                return ("Absent", 'red')
+            if am == 'none' and pm in ('present', 'late'):
+                return ("Présent (PM)", 'green')
+            if am == 'none' and pm == 'absent':
+                return ("Absent (PM)", 'red')
+            return ("—", 'black')
+
+        if am_expected and not pm_expected:
+            if am == 'absent':
+                return ("Absent", 'red')
+            if am == 'late':
+                return ("En retard", 'orange')
+            if am == 'present':
+                return ("Présent", 'green')
+            return ("—", 'black')
+
+        if pm_expected and not am_expected:
+            if pm == 'absent':
+                return ("Absent (PM)", 'red')
+            if pm in ('present', 'late'):
+                return ("Présent (PM)", 'green')
+            return ("—", 'black')
+
         return ("—", 'black')
 
     def apply_halfday(self):
@@ -576,7 +966,7 @@ class PresenceWin(tk.Toplevel):
 
 # ---------- Paramètres ----------
 class SettingsWin(tk.Toplevel):
-    DAYS = [("Lun", "Mon"), ("Mar", "Tue"), ("Mer", "Wed"), ("Jeu", "Thu"), ("Ven", "Fri"), ("Sam", "Sat"), ("Dim", "Sun")]
+    DAYS = [(WEEKDAY_SHORT[key], key) for key in WEEKDAY_KEYS]
 
     def __init__(self, master, db: DB):
         tk.Toplevel.__init__(self, master)
@@ -794,31 +1184,23 @@ class SettingsWin(tk.Toplevel):
             "SELECT * FROM attendance WHERE date BETWEEN ? AND ?",
             (start.strftime(DATE_FMT), end.strftime(DATE_FMT)),
         )
+        schedules = self.db.fetch_effective_schedules()
         for r in cur:
             d = datetime.strptime(r['date'], DATE_FMT).date()
             if self.is_holiday_off(d):
                 continue
-            wd = d.weekday()
-            if wd == 6:  # dimanche ignoré
-                continue
-            half_unit = 0.5 if wd <= 4 else 0.25  # samedi = demi-journée travaillée
             am = (r['am_status'] or 'none')
             pm = (r['pm_status'] or 'none')
-            rec = stats[r['employee_id']]
-            if pm == 'none':
-                if am == 'absent':
-                    rec[1] += half_unit * 2
-                elif am == 'late':
-                    rec[2] += 1
-            else:
-                if am == 'absent' and pm in ('present', 'late'):
-                    rec[1] += half_unit
-                if am in ('present', 'late') and pm == 'absent':
-                    rec[1] += half_unit
-                if am == 'absent' and pm == 'absent':
-                    rec[1] += half_unit * 2
-                if am == 'late':
-                    rec[2] += 1
+            emp_id = r['employee_id']
+            if emp_id not in stats:
+                continue
+            segments = self.db.day_segments_for(emp_id, d, schedules)
+            if not segments['am'] and not segments['pm']:
+                continue
+            abs_units, late = compute_absence_and_late(segments['am'], segments['pm'], am, pm)
+            rec = stats[emp_id]
+            rec[1] += abs_units
+            rec[2] += late
         return list(stats.values())
 
     def is_holiday_off(self, d: date) -> bool:
@@ -1211,16 +1593,15 @@ class SalariesWin(tk.Toplevel):
     def compute_work_units(self) -> float:
         start, end = self.month_limits()
         total = 0.0
+        default = self.db.default_week_schedule()
         d = start
         while d <= end:
             if self.is_holiday_off(d):
                 d += timedelta(days=1)
                 continue
-            wd = d.weekday()
-            if wd <= 4:
-                total += 1.0
-            elif wd == 5:
-                total += 0.5
+            seg = default.get(weekday_key(d), {"am": False, "pm": False})
+            total += 0.5 * int(bool(seg.get("am")))
+            total += 0.5 * int(bool(seg.get("pm")))
             d += timedelta(days=1)
         return total
 
@@ -1240,31 +1621,22 @@ class SalariesWin(tk.Toplevel):
             "SELECT * FROM attendance WHERE date BETWEEN ? AND ?",
             (start.strftime(DATE_FMT), end.strftime(DATE_FMT)),
         )
+        schedules = self.db.fetch_effective_schedules()
         for row in cur:
             d = datetime.strptime(row["date"], DATE_FMT).date()
             if self.is_holiday_off(d):
                 continue
-            wd = d.weekday()
-            if wd == 6:
-                continue
-            half_unit = 0.5 if wd <= 4 else 0.25
             am = row["am_status"] or "none"
             pm = row["pm_status"] or "none"
             emp_id = row["employee_id"]
-            if pm == "none":
-                if am == "absent":
-                    stats[emp_id]["abs_units"] += half_unit * 2
-                elif am == "late":
-                    stats[emp_id]["late"] += 1
-            else:
-                if am == "absent" and pm in ("present", "late"):
-                    stats[emp_id]["abs_units"] += half_unit
-                if am in ("present", "late") and pm == "absent":
-                    stats[emp_id]["abs_units"] += half_unit
-                if am == "absent" and pm == "absent":
-                    stats[emp_id]["abs_units"] += half_unit * 2
-                if am == "late":
-                    stats[emp_id]["late"] += 1
+            if emp_id not in stats:
+                continue
+            segments = self.db.day_segments_for(emp_id, d, schedules)
+            if not segments['am'] and not segments['pm']:
+                continue
+            abs_units, late = compute_absence_and_late(segments['am'], segments['pm'], am, pm)
+            stats[emp_id]["abs_units"] += abs_units
+            stats[emp_id]["late"] += late
         return stats
 
 
