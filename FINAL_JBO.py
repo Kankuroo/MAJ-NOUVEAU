@@ -1479,46 +1479,139 @@ class DataManager:
             conn.close()
 
 
-    def reset_database(self, reset_name: str):
-        """Archive la base actuelle et recrée une base vide.
+    def reset_database(self, reset_name: str) -> int:
+        """Archive uniquement les travaux terminés et les supprime de la base active."""
 
-        Le fichier SQLite courant est déplacé dans le dossier ``archives`` avec
-        un nom basé sur la date/heure et ``reset_name``. Un enregistrement est
-        ajouté dans ``archives/resets.json`` puis une nouvelle base vide est
-        générée via :func:`ensure_db_exists`.
-        """
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM jobs ORDER BY id")
+        all_jobs = cur.fetchall()
+        finished_statuses = {"fini", "terminé", "termine"}
+        finished_jobs = [
+            dict(row)
+            for row in all_jobs
+            if (row["status"] or "").strip().lower() in finished_statuses
+        ]
+
+        if not finished_jobs:
+            conn.close()
+            return 0
+
+        job_ids = [job["id"] for job in finished_jobs]
+        placeholders_jobs = ",".join("?" for _ in job_ids)
+
+        cur.execute("SELECT * FROM workers ORDER BY id")
+        workers = [dict(row) for row in cur.fetchall()]
+
+        cur.execute(
+            f"SELECT * FROM steps WHERE job_id IN ({placeholders_jobs}) ORDER BY id",
+            job_ids,
+        )
+        steps = [dict(row) for row in cur.fetchall()]
+        step_ids = [step["id"] for step in steps]
+
+        details = []
+        issues = []
+        deliveries = []
+        if step_ids:
+            placeholders_steps = ",".join("?" for _ in step_ids)
+            cur.execute(
+                f"SELECT * FROM details WHERE step_id IN ({placeholders_steps}) ORDER BY id",
+                step_ids,
+            )
+            details = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                f"SELECT * FROM issues WHERE step_id IN ({placeholders_steps}) ORDER BY id",
+                step_ids,
+            )
+            issues = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                f"SELECT * FROM deliveries WHERE step_id IN ({placeholders_steps}) ORDER BY id",
+                step_ids,
+            )
+            deliveries = [dict(row) for row in cur.fetchall()]
+
         archives_dir = os.path.join(BASE_DIR, "archives")
         os.makedirs(archives_dir, exist_ok=True)
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         display_name = reset_name.strip() if reset_name else reset_name
         sanitized_source = display_name or "reset"
-        safe_name = re.sub(r"[^\w.-]+", "_", sanitized_source.replace("/", "_").replace("\\", "_")) or "reset"
+        safe_name = re.sub(
+            r"[^\w.-]+",
+            "_",
+            sanitized_source.replace("/", "_").replace("\\", "_"),
+        ) or "reset"
         archive_filename = f"{timestamp}_{safe_name}.db"
         archive_path = os.path.join(archives_dir, archive_filename)
 
-        preserved_workers = []
-        if os.path.exists(self.db_path):
-            conn_current = None
-            try:
-                conn_current = sqlite3.connect(self.db_path)
-                cur = conn_current.cursor()
-                cur.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='workers'"
-                )
-                if cur.fetchone():
-                    cur.execute(
-                        "SELECT name, ordre FROM workers ORDER BY id"
-                    )
-                    preserved_workers = cur.fetchall()
-            except sqlite3.Error:
-                preserved_workers = []
-            finally:
-                if conn_current is not None:
-                    conn_current.close()
+        ensure_db_exists(archive_path)
 
-        if os.path.exists(self.db_path):
-            shutil.move(self.db_path, archive_path)
+        def _insert_rows(cursor, table, rows):
+            if not rows:
+                return
+            columns = list(rows[0].keys())
+            placeholders = ",".join("?" for _ in columns)
+            column_list = ", ".join(columns)
+            values = [tuple(row[col] for col in columns) for row in rows]
+            cursor.executemany(
+                f"INSERT INTO {table} ({column_list}) VALUES ({placeholders})",
+                values,
+            )
+
+        archive_conn = sqlite3.connect(archive_path)
+        try:
+            archive_cursor = archive_conn.cursor()
+            _insert_rows(archive_cursor, "workers", workers)
+            _insert_rows(archive_cursor, "jobs", finished_jobs)
+            _insert_rows(archive_cursor, "steps", steps)
+            _insert_rows(archive_cursor, "details", details)
+            _insert_rows(archive_cursor, "issues", issues)
+            _insert_rows(archive_cursor, "deliveries", deliveries)
+            archive_conn.commit()
+        except Exception:
+            archive_conn.rollback()
+            archive_conn.close()
+            try:
+                os.remove(archive_path)
+            except OSError:
+                pass
+            raise
+        else:
+            archive_conn.close()
+
+        try:
+            conn.execute("BEGIN")
+            if step_ids:
+                placeholders_steps = ",".join("?" for _ in step_ids)
+                cur.execute(
+                    f"DELETE FROM deliveries WHERE step_id IN ({placeholders_steps})",
+                    step_ids,
+                )
+                cur.execute(
+                    f"DELETE FROM details WHERE step_id IN ({placeholders_steps})",
+                    step_ids,
+                )
+                cur.execute(
+                    f"DELETE FROM issues WHERE step_id IN ({placeholders_steps})",
+                    step_ids,
+                )
+                cur.execute(
+                    f"DELETE FROM steps WHERE id IN ({placeholders_steps})",
+                    step_ids,
+                )
+            cur.execute(
+                f"DELETE FROM jobs WHERE id IN ({placeholders_jobs})",
+                job_ids,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
         resets_file = os.path.join(archives_dir, "resets.json")
         resets = []
@@ -1529,23 +1622,18 @@ class DataManager:
             except Exception:
                 resets = []
 
-        resets.append({"name": display_name or reset_name, "timestamp": timestamp, "path": archive_path})
+        resets.append(
+            {
+                "name": display_name or reset_name,
+                "timestamp": timestamp,
+                "path": archive_path,
+                "archived_jobs": len(job_ids),
+            }
+        )
         with open(resets_file, "w", encoding="utf-8") as f:
             json.dump(resets, f, ensure_ascii=False, indent=2)
 
-        ensure_db_exists(self.db_path)
-
-        if preserved_workers:
-            conn_new = self._connect()
-            try:
-                cur_new = conn_new.cursor()
-                cur_new.executemany(
-                    "INSERT OR IGNORE INTO workers (name, ordre) VALUES (?, ?)",
-                    preserved_workers,
-                )
-                conn_new.commit()
-            finally:
-                conn_new.close()
+        return len(job_ids)
 
     def list_resets(self):
         """Retourne la liste des réinitialisations archivées, triées par date."""
@@ -3921,7 +4009,20 @@ class MainApplication(tk.Tk):
         name = simple_input(self, "Nom du reset", "Nom pour cette réinitialisation :")
         if not name:
             return
-        self.data_manager.reset_database(name)
+        try:
+            archived = self.data_manager.reset_database(name)
+        except Exception as exc:
+            messagebox.showerror("Réinitialisation", f"Impossible de réinitialiser : {exc}")
+            return
+
+        if not archived:
+            messagebox.showinfo("Réinitialisation", "Aucun travail fini à archiver.")
+        else:
+            messagebox.showinfo(
+                "Réinitialisation",
+                f"{archived} travail(s) fini(s) archivé(s).",
+            )
+
         self.refresh_job_list()
         self.on_workers_changed()
 
