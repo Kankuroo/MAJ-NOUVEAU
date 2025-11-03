@@ -226,10 +226,12 @@ class DB:
         return list(
             self.conn.execute(
                 """
-                SELECT employee_id, COALESCE(SUM(amount), 0) AS total
-                FROM advances
-                WHERE taken_at >= ? AND taken_at < ?
-                GROUP BY employee_id
+                SELECT e.id AS employee_id, e.name, COALESCE(SUM(a.amount), 0) AS total
+                FROM advances a
+                JOIN employees e ON e.id = a.employee_id
+                WHERE a.taken_at >= ? AND a.taken_at < ?
+                GROUP BY e.id
+                ORDER BY e.name
                 """,
                 (start, end),
             )
@@ -936,14 +938,15 @@ class SalariesWin(tk.Toplevel):
     def refresh_advances_tab(self):
         for item in self.adv_tree.get_children():
             self.adv_tree.delete(item)
-        rows = self.db.advances_totals()
+        today = today_local()
+        rows = self.db.monthly_advances(today.year, today.month)
         total_amount = 0.0
         for r in rows:
             total = float(r["total"] or 0)
             total_amount += total
             self.adv_tree.insert('', 'end', iid=str(r["employee_id"]), values=(r["name"], f"{total:.2f}"))
         self.adv_summary.config(
-            text="Total des avances enregistrées : {:.2f}".format(total_amount)
+            text="Total des avances du mois en cours : {:.2f}".format(total_amount)
         )
 
     def on_advances_double_click(self, event):
