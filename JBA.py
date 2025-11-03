@@ -44,7 +44,9 @@ except ImportError:
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_CODE = "JBA"
 DB_FILENAME = os.path.join(BASE_DIR, "bijouterie_JBA.db")
+RESET_HISTORY_FILENAME = f"resets_{APP_CODE.lower()}.json"
 
 USE_API = os.environ.get("JBA_USE_API", "0").lower() in {"1", "true", "yes", "on"}
 API_BASE = os.environ.get("JBA_API_BASE", "http://127.0.0.1:8000")
@@ -1613,7 +1615,7 @@ class DataManager:
         finally:
             conn.close()
 
-        resets_file = os.path.join(archives_dir, "resets.json")
+        resets_file = os.path.join(archives_dir, RESET_HISTORY_FILENAME)
         resets = []
         if os.path.exists(resets_file):
             try:
@@ -1628,6 +1630,8 @@ class DataManager:
                 "timestamp": timestamp,
                 "path": archive_path,
                 "archived_jobs": len(job_ids),
+                "app": APP_CODE,
+                "source_db": os.path.basename(self.db_path),
             }
         )
         with open(resets_file, "w", encoding="utf-8") as f:
@@ -1638,14 +1642,35 @@ class DataManager:
     def list_resets(self):
         """Retourne la liste des réinitialisations archivées, triées par date."""
         archives_dir = os.path.join(BASE_DIR, "archives")
-        resets_file = os.path.join(archives_dir, "resets.json")
-        if not os.path.exists(resets_file):
-            return []
-        try:
-            with open(resets_file, "r", encoding="utf-8") as f:
-                resets = json.load(f)
-        except Exception:
-            return []
+        resets_file = os.path.join(archives_dir, RESET_HISTORY_FILENAME)
+        if os.path.exists(resets_file):
+            try:
+                with open(resets_file, "r", encoding="utf-8") as f:
+                    resets = json.load(f)
+            except Exception:
+                return []
+        else:
+            legacy_file = os.path.join(archives_dir, "resets.json")
+            if not os.path.exists(legacy_file):
+                return []
+            try:
+                with open(legacy_file, "r", encoding="utf-8") as f:
+                    legacy_resets = json.load(f)
+            except Exception:
+                return []
+            allowed_db = os.path.basename(self.db_path)
+            resets = [
+                r
+                for r in legacy_resets
+                if r.get("app") == APP_CODE or r.get("source_db") == allowed_db
+            ]
+            if resets:
+                os.makedirs(archives_dir, exist_ok=True)
+                try:
+                    with open(resets_file, "w", encoding="utf-8") as f:
+                        json.dump(resets, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
         return sorted(resets, key=lambda r: r.get("timestamp", ""), reverse=True)
 
 
