@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS employee_schedules (
 
 DEFAULT_SETTINGS = {
     "workdays": "Mon,Tue,Wed,Thu,Fri",
+    "workdays_segments": "",
     "arrival_time": "08:00",
     "halfday_pivot": "10:00",
     "admin_password": "",
@@ -386,13 +387,61 @@ class DB:
                 }
         return completed
 
+    def _parse_segments_payload(self, raw: str) -> dict:
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        segments = {}
+        if isinstance(data, dict):
+            for key, entry in data.items():
+                if key not in WEEKDAY_KEYS:
+                    continue
+                am = False
+                pm = False
+                if isinstance(entry, dict):
+                    am = bool(entry.get("am"))
+                    pm = bool(entry.get("pm"))
+                elif isinstance(entry, str):
+                    value = entry.lower().strip()
+                    if value in {"full", "both", "am_pm"}:
+                        am = True
+                        pm = True
+                    elif value in {"am", "morning"}:
+                        am = True
+                    elif value in {"pm", "afternoon"}:
+                        pm = True
+                segments[key] = {"am": am, "pm": pm}
+        return segments
+
     def default_week_schedule(self) -> dict:
-        workdays = (self.get("workdays", DEFAULT_SETTINGS["workdays"]) or DEFAULT_SETTINGS["workdays"]).split(",")
-        workset = {item.strip() for item in workdays if item.strip()}
-        return {
-            key: {"am": key in workset, "pm": key in workset}
-            for key in WEEKDAY_KEYS
-        }
+        raw_segments = self.get("workdays_segments", DEFAULT_SETTINGS.get("workdays_segments", ""))
+        parsed = self._parse_segments_payload(raw_segments)
+        legacy = (self.get("workdays", DEFAULT_SETTINGS["workdays"]) or DEFAULT_SETTINGS["workdays"]).split(",")
+        legacy_set = {item.strip() for item in legacy if item.strip()}
+        schedule = {}
+        for key in WEEKDAY_KEYS:
+            if key in parsed:
+                seg = parsed[key]
+                schedule[key] = {"am": bool(seg.get("am")), "pm": bool(seg.get("pm"))}
+            else:
+                is_workday = key in legacy_set
+                schedule[key] = {"am": is_workday, "pm": is_workday}
+        return schedule
+
+    def set_default_week_schedule(self, schedule: dict):
+        normalized = {}
+        for key in WEEKDAY_KEYS:
+            seg = schedule.get(key, {}) if isinstance(schedule, dict) else {}
+            normalized[key] = {
+                "am": bool(seg.get("am")),
+                "pm": bool(seg.get("pm")),
+            }
+        self.set("workdays_segments", json.dumps(normalized, sort_keys=True))
+        legacy_days = [key for key, seg in normalized.items() if seg.get("am") or seg.get("pm")]
+        self.set("workdays", ",".join(legacy_days))
 
     def employee_custom_schedule(self, employee_id: int) -> dict:
         row = self.conn.execute(
@@ -967,6 +1016,12 @@ class PresenceWin(tk.Toplevel):
 # ---------- Paramètres ----------
 class SettingsWin(tk.Toplevel):
     DAYS = [(WEEKDAY_SHORT[key], key) for key in WEEKDAY_KEYS]
+    DAY_OPTIONS = [
+        "Repos",
+        "Matin uniquement",
+        "Après-midi uniquement",
+        "Journée complète",
+    ]
 
     def __init__(self, master, db: DB):
         tk.Toplevel.__init__(self, master)
@@ -999,12 +1054,15 @@ class SettingsWin(tk.Toplevel):
         for i in range(7):
             days_grid.grid_columnconfigure(i, weight=1, uniform="days")
         self.day_vars = {}
-        current = set((self.db.get("workdays", DEFAULT_SETTINGS["workdays"]) or "Mon,Tue,Wed,Thu,Fri").split(','))
+        default_schedule = self.db.default_week_schedule()
         for i, (label, key) in enumerate(self.DAYS):
-            var = tk.BooleanVar(value=(key in current))
+            seg = default_schedule.get(key, {"am": False, "pm": False})
+            var = tk.StringVar(value=self._segment_to_label(seg))
             self.day_vars[key] = var
             pad = (14,6) if i == 0 else 6  # petit décalage homogène pour **Lundi**
-            ttk.Checkbutton(days_grid, text=label, variable=var).grid(row=0, column=i, padx=pad, pady=4, sticky='w')
+            ttk.Label(days_grid, text=label).grid(row=0, column=i, padx=pad, pady=(0,2), sticky='w')
+            combo = ttk.Combobox(days_grid, textvariable=var, values=self.DAY_OPTIONS, state='readonly', width=16)
+            combo.grid(row=1, column=i, padx=pad, pady=(2,6), sticky='we')
 
         ttk.Label(frm, text="Heure d'arrivée (retard si après)").grid(row=2, column=0, sticky='w', pady=(16,4))
         self.arrival_var = tk.StringVar(value=self.db.get("arrival_time", DEFAULT_SETTINGS["arrival_time"]))
@@ -1066,9 +1124,30 @@ class SettingsWin(tk.Toplevel):
         ttk.Label(adm, text="Définir / changer le mot de passe admin").pack(anchor='w')
         ttk.Button(adm, text="Définir le mot de passe", command=self.set_admin_password).pack(anchor='w', pady=6)
 
+    def _segment_to_label(self, segment: dict) -> str:
+        am = bool(segment.get("am"))
+        pm = bool(segment.get("pm"))
+        if am and pm:
+            return "Journée complète"
+        if am and not pm:
+            return "Matin uniquement"
+        if pm and not am:
+            return "Après-midi uniquement"
+        return "Repos"
+
+    def _label_to_segment(self, label: str) -> dict:
+        label = (label or "").strip()
+        if label == "Journée complète":
+            return {"am": True, "pm": True}
+        if label == "Matin uniquement":
+            return {"am": True, "pm": False}
+        if label == "Après-midi uniquement":
+            return {"am": False, "pm": True}
+        return {"am": False, "pm": False}
+
     def save_work_settings(self):
-        days = [k for (label,k) in self.DAYS if self.day_vars[k].get()]
-        self.db.set("workdays", ",".join(days))
+        schedule = {key: self._label_to_segment(self.day_vars[key].get()) for (_, key) in self.DAYS}
+        self.db.set_default_week_schedule(schedule)
         self.db.set("arrival_time", self.arrival_var.get().strip() or DEFAULT_SETTINGS["arrival_time"])
         self.db.set("halfday_pivot", self.pivot_var.get().strip() or DEFAULT_SETTINGS["halfday_pivot"])
         messagebox.showinfo("OK", "Paramètres enregistrés")
@@ -1168,9 +1247,8 @@ class SettingsWin(tk.Toplevel):
             self.lbl_summary.config(text="")
 
     def is_working_day(self, d: date) -> bool:
-        wd = d.strftime("%a")
-        workset = set((self.db.get("workdays", DEFAULT_SETTINGS["workdays"]) or "Mon,Tue,Wed,Thu,Fri").split(','))
-        if wd not in workset:
+        seg = self.db.default_week_schedule().get(weekday_key(d), {"am": False, "pm": False})
+        if not (seg.get("am") or seg.get("pm")):
             return False
         r = self.db.conn.execute("SELECT is_working_day FROM holidays WHERE date=?", (d.strftime(DATE_FMT),)).fetchone()
         if r is not None:
