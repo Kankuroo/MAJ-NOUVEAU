@@ -86,6 +86,24 @@ FALLBACK_FONT_FAMILIES = (
 )
 
 
+STEP_COLOR_MAP = {
+    'jobwork pret': '#00008B',
+    'jobwork prêt': '#00008B',
+    'tige': '#FF0000',
+    'limage & montage': '#FFFF00',
+    'limage/ montage': '#FFFF00',
+    'limage/montage': '#FFFF00',
+    'papier': '#FFA500',
+    'sertissage': '#800080',
+    'correction': '#FF69B4',
+    'vérification qualité': '#A52A2A',
+    'verification qualite': '#A52A2A',
+    'polissage': '#1E90FF',
+    'polissage final': '#00FFFF',
+    'fini': '#008000',
+}
+
+
 def ensure_db_exists(db_path: str):
     """Crée la base de données et ses tables si elles n'existent pas déjà."""
     conn = sqlite3.connect(db_path)
@@ -1672,6 +1690,88 @@ class DataManager:
                 except Exception:
                     pass
         return sorted(resets, key=lambda r: r.get("timestamp", ""), reverse=True)
+
+
+def build_monthly_totals(monthly_summary):
+    """Convertit la liste de synthèse mensuelle en dictionnaire par mois."""
+    totals = {}
+    for entry in monthly_summary or []:
+        if not entry:
+            continue
+        month_key, final_work, total_loss, *rest = entry
+        display_key = month_key
+        try:
+            display_key = datetime.strptime(month_key, "%Y-%m").strftime("%m/%Y")
+        except Exception:
+            pass
+        month_totals = totals.setdefault(display_key, {"final_work": 0.0, "total_loss": 0.0})
+        month_totals["final_work"] += final_work or 0.0
+        month_totals["total_loss"] += total_loss or 0.0
+    return totals
+
+
+def display_monthly_summary(master, data, monthly_totals, title):
+    """Affiche un bilan mensuel à partir de données fournies."""
+    if not data:
+        messagebox.showinfo(title, "Aucune donnée disponible pour le moment.")
+        return
+    win = tk.Toplevel(master)
+    win.title(title)
+    try:
+        bg_color = master.cget('bg')
+        win.configure(bg=bg_color)
+    except Exception:
+        pass
+    cols = ("Étape", "GWT", "Durée", "Perte (g)", "Perte (%)")
+    tree = ttk.Treeview(win, columns=cols, show="tree headings")
+    tree.heading("#0", text="Section")
+    for col in cols:
+        tree.heading(col, text=col)
+        tree.column(col, anchor="center", minwidth=80, width=100)
+
+    for name_norm, color in STEP_COLOR_MAP.items():
+        tree.tag_configure(name_norm, background=color)
+
+    monthly_totals = monthly_totals or {}
+    for month in sorted(data.keys()):
+        month_id = tree.insert('', 'end', text=month, open=False)
+        for worker in sorted(data[month].keys()):
+            worker_id = tree.insert(month_id, 'end', text=worker, open=False)
+            for step_name, vals in data[month][worker].items():
+                name_norm = step_name.lower()
+                tree.insert(
+                    worker_id,
+                    'end',
+                    text='',
+                    values=(
+                        step_name,
+                        f"{vals['gwt']:.2f}",
+                        format_duration(vals['duration']),
+                        f"{vals['loss_g']:.2f}",
+                        f"{vals['loss_pct']:.2f}%",
+                    ),
+                    tags=(name_norm,),
+                )
+        month_totals = monthly_totals.get(month, {})
+        month_gwt_total = month_totals.get("final_work", 0.0)
+        month_loss_total = month_totals.get("total_loss", 0.0)
+        total_pct = (month_loss_total / month_gwt_total * 100.0) if month_gwt_total else 0.0
+        tree.insert(
+            month_id,
+            'end',
+            text='TOTAL',
+            values=(
+                '',
+                f"{month_gwt_total:.2f}",
+                '',
+                f"{month_loss_total:.2f}",
+                f"{total_pct:.2f}%",
+            ),
+            tags=('total_row',),
+        )
+
+    tree.tag_configure('total_row', font=(DEFAULT_FONT_FAMILY, 9, 'bold'))
+    tree.pack(fill='both', expand=True)
 
 
 class StepFrame(ttk.LabelFrame):
@@ -3923,21 +4023,6 @@ class MainApplication(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Erreur", f"Impossible de récupérer les travaux : {exc}")
             return
-        color_map = {
-            'jobwork pret': '#00008B',
-            'jobwork prêt': '#00008B',
-            'tige': '#FF0000',
-            'limage & montage': '#FFFF00',
-            'limage/ montage': '#FFFF00',
-            'limage/montage': '#FFFF00',
-            'papier': '#FFA500',
-            'sertissage': '#800080',
-            'correction': '#FF69B4',
-            'vérification qualité': '#A52A2A',
-            'verification qualite': '#A52A2A',
-            'polissage': '#1E90FF',
-            'polissage final': '#00FFFF',
-        }
         for row in jobs:
             job_id, ref, desc, status, start_time, end_time, total_loss, total_loss_pct = row
             status_text = status or ''
@@ -3962,7 +4047,7 @@ class MainApplication(tk.Tk):
                 start_fmt = step_issue_time or ''
                 end_fmt = ''
                 name_norm = step_name.lower()
-                bg_color = color_map.get(name_norm, '#FFFFFF')
+                bg_color = STEP_COLOR_MAP.get(name_norm, '#FFFFFF')
             elif is_finished:
                 summary = self.data_manager.get_job_summary(job_id)
                 worker = summary['worker'] if summary else ''
@@ -3974,7 +4059,7 @@ class MainApplication(tk.Tk):
                 worker = last_completed[2] or ''
                 end_fmt = last_completed[3] or ''
                 name_norm = step_name.lower()
-                bg_color = color_map.get(name_norm, '#FFFFFF')
+                bg_color = STEP_COLOR_MAP.get(name_norm, '#FFFFFF')
             else:
                 summary = self.data_manager.get_job_summary(job_id)
                 worker = summary['worker'] if summary else ''
@@ -4112,110 +4197,24 @@ class MainApplication(tk.Tk):
         """Ouvre le bilan mensuel pour une base archivée."""
         dm = DataManager(reset.get("path"))
         worker_data = dm.get_worker_monthly_summary()
-        monthly_totals = self._build_monthly_totals(dm.get_monthly_summary())
-        self.display_monthly_summary(
+        monthly_totals = build_monthly_totals(dm.get_monthly_summary())
+        display_monthly_summary(
+            self,
             worker_data,
             monthly_totals,
             title=f"Bilan – {reset.get('name', '')}",
         )
-
-    def _build_monthly_totals(self, monthly_summary):
-        """Convertit la liste de synthèse mensuelle en dictionnaire par mois."""
-        totals = {}
-        for entry in monthly_summary or []:
-            if not entry:
-                continue
-            month_key, final_work, total_loss, *rest = entry
-            display_key = month_key
-            try:
-                display_key = datetime.strptime(month_key, "%Y-%m").strftime("%m/%Y")
-            except Exception:
-                pass
-            month_totals = totals.setdefault(display_key, {"final_work": 0.0, "total_loss": 0.0})
-            month_totals["final_work"] += final_work or 0.0
-            month_totals["total_loss"] += total_loss or 0.0
-        return totals
-
-    def display_monthly_summary(self, data, monthly_totals, title):
-        """Affiche un bilan mensuel à partir de données fournies."""
-        if not data:
-            messagebox.showinfo(title, "Aucune donnée disponible pour le moment.")
-            return
-        win = tk.Toplevel(self)
-        win.title(title)
-        win.configure(bg=self.cget('bg'))
-        cols = ("Étape", "GWT", "Durée", "Perte (g)", "Perte (%)")
-        tree = ttk.Treeview(win, columns=cols, show="tree headings")
-        tree.heading("#0", text="Section")
-        for col in cols:
-            tree.heading(col, text=col)
-            tree.column(col, anchor="center", minwidth=80, width=100)
-
-        color_map = {
-            'jobwork pret': '#00008B',
-            'jobwork prêt': '#00008B',
-            'tige': '#FF0000',
-            'limage & montage': '#FFFF00',
-            'limage/ montage': '#FFFF00',
-            'limage/montage': '#FFFF00',
-            'papier': '#FFA500',
-            'sertissage': '#800080',
-            'correction': '#FF69B4',
-            'vérification qualité': '#A52A2A',
-            'verification qualite': '#A52A2A',
-            'polissage': '#1E90FF',
-            'polissage final': '#00FFFF',
-            'fini': '#008000',
-        }
-        for name_norm, color in color_map.items():
-            tree.tag_configure(name_norm, background=color)
-
-        monthly_totals = monthly_totals or {}
-        for month in sorted(data.keys()):
-            month_id = tree.insert('', 'end', text=month, open=False)
-            for worker in sorted(data[month].keys()):
-                worker_id = tree.insert(month_id, 'end', text=worker, open=False)
-                for step_name, vals in data[month][worker].items():
-                    name_norm = step_name.lower()
-                    tree.insert(
-                        worker_id,
-                        'end',
-                        text='',
-                        values=(
-                            step_name,
-                            f"{vals['gwt']:.2f}",
-                            format_duration(vals['duration']),
-                            f"{vals['loss_g']:.2f}",
-                            f"{vals['loss_pct']:.2f}%",
-                        ),
-                        tags=(name_norm,),
-                    )
-            month_totals = monthly_totals.get(month, {})
-            month_gwt_total = month_totals.get("final_work", 0.0)
-            month_loss_total = month_totals.get("total_loss", 0.0)
-            total_pct = (month_loss_total / month_gwt_total * 100.0) if month_gwt_total else 0.0
-            tree.insert(
-                month_id,
-                'end',
-                text='TOTAL',
-                values=(
-                    '',
-                    f"{month_gwt_total:.2f}",
-                    '',
-                    f"{month_loss_total:.2f}",
-                    f"{total_pct:.2f}%",
-                ),
-                tags=('total_row',),
-            )
-
-        tree.tag_configure('total_row', font=(DEFAULT_FONT_FAMILY, 9, 'bold'))
-        tree.pack(fill='both', expand=True)
+        ArchivedJobsWindow(
+            self,
+            dm,
+            title=f"Archives – {reset.get('name', '')}",
+        )
 
     def show_monthly_summary(self):
         """Affiche un bilan mensuel détaillé par ouvrier et étape."""
         worker_data = self.data_manager.get_worker_monthly_summary()
-        monthly_totals = self._build_monthly_totals(self.data_manager.get_monthly_summary())
-        self.display_monthly_summary(worker_data, monthly_totals, title="Bilan mensuel")
+        monthly_totals = build_monthly_totals(self.data_manager.get_monthly_summary())
+        display_monthly_summary(self, worker_data, monthly_totals, title="Bilan mensuel")
 
     def edit_job(self):
        item = self.tree.focus()
@@ -4253,6 +4252,181 @@ class MainApplication(tk.Tk):
        tk.Button(top, text="Enregistrer", command=save_modification).pack(pady=10)
        top.grab_set()
 
+
+
+class ArchivedJobDetailWindow(tk.Toplevel):
+    """Affiche les détails d'un job archivé en lecture seule."""
+
+    def __init__(self, master, data_manager: DataManager, job_id: int):
+        super().__init__(master)
+        self.data_manager = data_manager
+        job, steps = self.data_manager.get_job(job_id)
+        if not job:
+            messagebox.showerror("Archive", "Job introuvable dans l'archive.")
+            self.destroy()
+            return
+
+        self.title(f"Archive – {job[1]}")
+        self.geometry("850x500")
+        ttk.Label(self, text=f"Référence : {job[1]}", font=(DEFAULT_FONT_FAMILY, 14, "bold")).pack(pady=5, anchor='w', padx=10)
+        ttk.Label(self, text=f"Description : {job[2] or ''}").pack(pady=2, anchor='w', padx=10)
+        info_frame = ttk.Frame(self)
+        info_frame.pack(fill='x', padx=10, pady=5)
+        ttk.Label(info_frame, text=f"Statut : {job[3] or 'En cours'}").pack(side='left')
+        if job[6] is not None:
+            ttk.Label(info_frame, text=f"Perte totale : {job[6]:.2f} g").pack(side='left', padx=15)
+        if job[7] is not None:
+            ttk.Label(info_frame, text=f"Perte % : {job[7]:.2f}%").pack(side='left')
+
+        columns = ("Étape", "Ouvrier", "Donné", "Retour", "Perte (g)", "Perte (%)", "Desc. donné", "Desc. retour")
+        tree = ttk.Treeview(self, columns=columns, show='headings', selectmode='browse')
+        for col in columns:
+            anchor = 'center'
+            width = 120 if col in {"Desc. donné", "Desc. retour"} else 100
+            tree.heading(col, text=col)
+            tree.column(col, anchor=anchor, minwidth=80, width=width)
+
+        for step in steps:
+            loss_weight = step[16]
+            loss_pct = step[17]
+            tree.insert(
+                '',
+                'end',
+                values=(
+                    step[2],
+                    step[3] or '',
+                    step[4] or '',
+                    step[10] or '',
+                    f"{loss_weight:.2f}" if loss_weight is not None else '',
+                    f"{loss_pct:.2f}%" if loss_pct is not None else '',
+                    step[5] or '',
+                    step[11] or '',
+                ),
+            )
+
+        tree.pack(fill='both', expand=True, padx=10, pady=10)
+        ttk.Label(self, text="Lecture seule – aucune modification n'est possible.").pack(pady=(0, 10))
+
+
+class ArchivedJobsWindow(tk.Toplevel):
+    """Fenêtre de consultation d'une base archivée (lecture seule)."""
+
+    def __init__(self, master, data_manager: DataManager, title: str = "Archives JBA"):
+        super().__init__(master)
+        self.data_manager = data_manager
+        self.title(title)
+        self.geometry("900x600")
+        try:
+            self.configure(bg=master.cget('bg'))
+        except Exception:
+            self.configure(bg='#F5F7FA')
+
+        ttk.Label(
+            self,
+            text="Consultation des archives en lecture seule.",
+            font=(DEFAULT_FONT_FAMILY, 11, "bold"),
+        ).pack(padx=10, pady=(10, 5), anchor='w')
+
+        toolbar = ttk.Frame(self)
+        toolbar.pack(fill='x', pady=5)
+        ttk.Button(toolbar, text="Nouveau JBA", state='disabled').pack(side='left', padx=5)
+        ttk.Button(toolbar, text="Supprimer", state='disabled').pack(side='left', padx=5)
+        ttk.Button(toolbar, text="Modifier JBA", state='disabled').pack(side='left', padx=5)
+        refresh_btn = ttk.Button(toolbar, text="Actualiser", command=self.refresh_job_list)
+        refresh_btn.pack(side='left', padx=5)
+        summary_btn = ttk.Button(toolbar, text="Bilan mensuel", command=self.show_monthly_summary)
+        summary_btn.pack(side='left', padx=5)
+
+        columns = ("Ref", "Description", "Étape", "Ouvrier", "Début", "Fin", "Perte %")
+        self.tree = ttk.Treeview(self, columns=columns, show='headings', selectmode='browse')
+        for col in columns:
+            self.tree.heading(col, text=col)
+            if col in ("Ref", "Étape"):
+                width = 80
+            elif col in ("Ouvrier", "Description"):
+                width = 150
+            else:
+                width = 100
+            self.tree.column(col, minwidth=60, width=width)
+        self.tree.pack(fill='both', expand=True, padx=5, pady=5)
+        self.tree.bind("<Double-1>", self.on_double_click)
+
+        self.refresh_job_list()
+
+    def refresh_job_list(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        try:
+            jobs = self.data_manager.list_jobs()
+        except Exception as exc:
+            messagebox.showerror("Archives", f"Impossible de récupérer les travaux : {exc}")
+            return
+
+        for row in jobs:
+            job_id, ref, desc, status, start_time, end_time, total_loss, total_loss_pct = row
+            status_text = status or ''
+            status_normalized = status_text.strip().lower()
+            is_finished = status_normalized in {"fini", "terminé"}
+
+            current = self.data_manager.get_current_step(job_id)
+            last_completed = None
+            if not current and not is_finished:
+                last_completed = self.data_manager.get_last_completed_step(job_id)
+
+            worker = ''
+            step_name = ''
+            start_fmt = start_time or ''
+            end_fmt = end_time or ''
+            bg_color = '#FFFFFF'
+
+            if current:
+                step_name = current[1] or ''
+                worker = current[2] or ''
+                step_issue_time = current[3]
+                start_fmt = step_issue_time or ''
+                end_fmt = ''
+                name_norm = step_name.lower()
+                bg_color = STEP_COLOR_MAP.get(name_norm, '#FFFFFF')
+            elif is_finished:
+                summary = self.data_manager.get_job_summary(job_id)
+                worker = summary['worker'] if summary else ''
+                display_status = status_text.strip() or 'Fini'
+                step_name = display_status
+                bg_color = STEP_COLOR_MAP.get('fini', '#008000')
+            elif last_completed:
+                step_name = last_completed[1] or ''
+                worker = last_completed[2] or ''
+                end_fmt = last_completed[3] or ''
+                name_norm = step_name.lower()
+                bg_color = STEP_COLOR_MAP.get(name_norm, '#FFFFFF')
+            else:
+                summary = self.data_manager.get_job_summary(job_id)
+                worker = summary['worker'] if summary else ''
+                step_name = 'À valider'
+
+            start_fmt = start_fmt or ''
+            end_fmt = end_fmt or ''
+            loss_pct = f"{total_loss_pct:.2f}%" if total_loss_pct is not None else ''
+
+            self.tree.insert(
+                '',
+                'end',
+                iid=job_id,
+                values=(ref, desc or '', step_name, worker, start_fmt, end_fmt, loss_pct),
+                tags=(f"job_{job_id}",),
+            )
+            self.tree.tag_configure(f"job_{job_id}", background=bg_color)
+
+    def on_double_click(self, event):
+        item = self.tree.focus()
+        if item:
+            job_id = int(item)
+            ArchivedJobDetailWindow(self, self.data_manager, job_id)
+
+    def show_monthly_summary(self):
+        worker_data = self.data_manager.get_worker_monthly_summary()
+        monthly_totals = build_monthly_totals(self.data_manager.get_monthly_summary())
+        display_monthly_summary(self, worker_data, monthly_totals, title=f"Bilan – {self.title()}")
 
 
 def simple_input(master, title, prompt):
