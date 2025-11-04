@@ -48,6 +48,9 @@ APP_CODE = "JBO"
 DB_FILENAME = os.path.join(BASE_DIR, "bijouterie_JBO.db")
 RESET_HISTORY_FILENAME = f"resets_{APP_CODE.lower()}.json"
 
+CARATS_PER_GRAM = 5.0
+GRAMS_PER_CARAT = 1.0 / CARATS_PER_GRAM
+
 USE_API = os.environ.get("JBO_USE_API", "0").lower() in {"1", "true", "yes", "on"}
 API_BASE = os.environ.get("JBO_API_BASE", "http://127.0.0.1:8000")
 
@@ -369,7 +372,27 @@ def normalize_numeric_value(value):
                     return float(match.group())
                 except ValueError:
                     return None
-    return None
+            return None
+
+
+def grams_to_carats(value):
+    """Convertit un poids en grammes vers les carats."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value) * CARATS_PER_GRAM
+    except (TypeError, ValueError):
+        return None
+
+
+def carats_to_grams(value):
+    """Convertit un poids en carats vers les grammes."""
+    if value in (None, ""):
+        return None
+    try:
+        return float(value) * GRAMS_PER_CARAT
+    except (TypeError, ValueError):
+        return None
 
 
 def compute_loss(
@@ -1865,7 +1888,7 @@ class StepFrame(ttk.LabelFrame):
                 'issue_time': i[1],
                 'gwt': i[2],           # pas de normalisation ici
                 'scrap': i[3],
-                'stone': i[4],
+                'stone': grams_to_carats(i[4]),
                 'finding': i[5],
                 'description': i[6],
                 'gwt_formula': i[7],
@@ -1889,7 +1912,7 @@ class StepFrame(ttk.LabelFrame):
             'issue_time': step_data[4],
             'gwt': normalize_numeric_value(step_data[6]),
             'scrap': normalize_numeric_value(step_data[7]),
-            'stone': normalize_numeric_value(step_data[8]),
+            'stone': grams_to_carats(step_data[8]),
             'finding': normalize_numeric_value(step_data[9]),
             'description': step_data[5],
             'gwt_formula': None,
@@ -1949,7 +1972,7 @@ class StepFrame(ttk.LabelFrame):
                 'delivery_time': d[1],
                 'gwt': normalize_numeric_value(d[2]),
                 'scrap': normalize_numeric_value(d[3]),
-                'return_stone': normalize_numeric_value(d[4]),
+                'return_stone': grams_to_carats(d[4]),
                 'return_finding': normalize_numeric_value(d[5]),
                 'description': d[6],
                 'gwt_formula': d[7],
@@ -1966,7 +1989,7 @@ class StepFrame(ttk.LabelFrame):
             'description': step_data[11],
             'gwt': normalize_numeric_value(step_data[12]),
             'scrap': normalize_numeric_value(step_data[13]),
-            'return_stone': normalize_numeric_value(step_data[14]),
+            'return_stone': grams_to_carats(step_data[14]),
             'return_finding': normalize_numeric_value(step_data[15]),
             'gwt_formula': None,
             'scrap_formula': None,
@@ -2016,7 +2039,8 @@ class StepFrame(ttk.LabelFrame):
             find_val = normalize_numeric_value(iss.get('finding'))
             issue_gwt_tot += gwt_val or 0.0
             issue_scrap_tot += scrap_val or 0.0
-            issue_stone_tot += stone_val or 0.0
+            stone_grams = carats_to_grams(stone_val)
+            issue_stone_tot += stone_grams or 0.0
             issue_find_tot += find_val or 0.0
             dt = iss.get('issue_time')
             if dt and (first_issue_time is None or dt < first_issue_time):
@@ -2032,7 +2056,8 @@ class StepFrame(ttk.LabelFrame):
             find_val = normalize_numeric_value(d.get('return_finding'))
             total_gwt += gwt_val or 0.0
             total_scrap += scrap_val or 0.0
-            total_stone += stone_val or 0.0
+            stone_grams = carats_to_grams(stone_val)
+            total_stone += stone_grams or 0.0
             total_find += find_val or 0.0
             dt = d.get('delivery_time')
             if dt and (last_time is None or dt > last_time):
@@ -3046,12 +3071,13 @@ class StepFrame(ttk.LabelFrame):
             desc = line['desc_var'].get().strip() or None
             if not any(v is not None for v in [dt, gwt, scrap, stone, find, desc]):
                 continue
+            stone_grams = carats_to_grams(stone)
             self.data_manager.add_issue(
                 self.step_id,
                 dt,
                 gwt,
                 scrap,
-                stone,
+                stone_grams,
                 find,
                 description=desc,
                 gwt_formula=gwt_formula,
@@ -3061,7 +3087,7 @@ class StepFrame(ttk.LabelFrame):
             )
             issue_gwt_total += gwt or 0.0
             issue_scrap_total += scrap or 0.0
-            issue_stone_total += stone or 0.0
+            issue_stone_total += stone_grams or 0.0
             issue_find_total += find or 0.0
             if dt and (first_time is None or dt < first_time):
                 first_time = dt
@@ -3123,12 +3149,13 @@ class StepFrame(ttk.LabelFrame):
                 return False
             if not any(v is not None for v in [dt, gwt, scrap, stone, find, desc]):
                 continue
+            stone_grams = carats_to_grams(stone)
             self.data_manager.add_delivery(
                 self.step_id,
                 dt,
                 gwt,
                 scrap,
-                stone,
+                stone_grams,
                 find,
                 description=desc,
                 gwt_formula=gwt_formula,
@@ -3139,7 +3166,7 @@ class StepFrame(ttk.LabelFrame):
             )
             delivery_gwt_total += gwt or 0.0
             delivery_scrap_total += scrap or 0.0
-            delivery_stone_total += stone or 0.0
+            delivery_stone_total += stone_grams or 0.0
             delivery_find_total += find or 0.0
             if dt and (last_time is None or dt > last_time):
                 last_time = dt
@@ -3240,13 +3267,34 @@ class DetailManageWindow(tk.Toplevel):
         self.deleted_detail_ids = []
 
 
+    def _format_number(self, value):
+        if value in (None, ""):
+            return ""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return ""
+        text = f"{number:.6f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+
     def load_details(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
         rows = self.data_manager.get_details(self.step_id, self.detail_type)
         for row in rows:
             detail_id, desc, pcs, gwt = row
-            self.tree.insert("", "end", iid=detail_id, values=(desc or "", pcs or "", gwt or ""))
+            display_gwt = gwt
+            if self.detail_type in {"stone", "return_stone"}:
+                display_gwt = grams_to_carats(gwt)
+            formatted_gwt = self._format_number(display_gwt)
+            pcs_display = "" if pcs in (None, "") else str(pcs)
+            self.tree.insert(
+                "",
+                "end",
+                iid=detail_id,
+                values=(desc or "", pcs_display, formatted_gwt),
+            )
         self.update_total()
 
     def add_row(self):
@@ -3300,10 +3348,13 @@ class DetailManageWindow(tk.Toplevel):
             except (TypeError, ValueError):
                 pcs_i = None
             desc_str = desc.strip() if isinstance(desc, str) else None
+            stored_gwt = gwt_f
+            if self.detail_type in {"stone", "return_stone"}:
+                stored_gwt = carats_to_grams(gwt_f)
             data = {
                 "description": desc_str or None,
                 "pcs": pcs_i,
-                "gwt": gwt_f,
+                "gwt": stored_gwt,
             }
             try:
                 detail_id = int(item)
@@ -3364,8 +3415,11 @@ class DetailManageWindow(tk.Toplevel):
         field_name = field_mapping.get(self.detail_type)
         if field_name:
             self.data_manager.update_step(self.step_id, **{field_name: total})
+        display_total = total
+        if self.detail_type in {"stone", "return_stone"}:
+            display_total = grams_to_carats(total)
         if self.update_callback:
-            self.update_callback(self.detail_type, total)
+            self.update_callback(self.detail_type, display_total)
 
     def close(self):
         self.save()
