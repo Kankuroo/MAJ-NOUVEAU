@@ -2247,6 +2247,7 @@ class StepFrame(ttk.LabelFrame):
         line_frame = ttk.Frame(self.issue_container)
         line_frame.grid(row=row, column=0, sticky="ew", pady=2)
         line_frame.columnconfigure(1, weight=1)
+        line_frame.columnconfigure(2, weight=0)
 
         ttk.Label(line_frame, text="Date/Heure :").grid(row=0, column=0, sticky="e")
         dt_entry = ttk.Entry(line_frame, textvariable=dt_var, width=19, state='disabled')
@@ -2255,20 +2256,24 @@ class StepFrame(ttk.LabelFrame):
         ttk.Label(line_frame, text="GWT :").grid(row=1, column=0, sticky="e")
         gwt_entry = ttk.Entry(line_frame, textvariable=gwt_var, width=10)
         gwt_entry.grid(row=1, column=1, sticky="w", padx=2, pady=2)
+        ttk.Label(line_frame, text="gr").grid(row=1, column=2, sticky="w")
 
         ttk.Label(line_frame, text="Scrap :").grid(row=2, column=0, sticky="e")
         scrap_entry = ttk.Entry(line_frame, textvariable=scrap_var, width=10)
         scrap_entry.grid(row=2, column=1, sticky="w", padx=2, pady=2)
+        ttk.Label(line_frame, text="gr").grid(row=2, column=2, sticky="w")
 
         stone_label = ttk.Label(line_frame, text="Stone :")
         stone_label.grid(row=3, column=0, sticky="e")
         stone_entry = ttk.Entry(line_frame, textvariable=stone_var, width=10)
         stone_entry.grid(row=3, column=1, sticky="w", padx=2, pady=2)
+        ttk.Label(line_frame, text="cts").grid(row=3, column=2, sticky="w")
 
         find_label = ttk.Label(line_frame, text="Find :")
         find_label.grid(row=4, column=0, sticky="e")
         find_entry = ttk.Entry(line_frame, textvariable=find_var, width=10)
         find_entry.grid(row=4, column=1, sticky="w", padx=2, pady=2)
+        ttk.Label(line_frame, text="gr").grid(row=4, column=2, sticky="w")
 
         ttk.Label(line_frame, text="Description :").grid(row=5, column=0, sticky="e")
         desc_entry = ttk.Entry(line_frame, textvariable=desc_var)
@@ -2770,6 +2775,7 @@ class StepFrame(ttk.LabelFrame):
         ttk.Label(line_frame, text="GWT :").grid(row=1, column=0, sticky="e")
         gwt_entry = ttk.Entry(line_frame, textvariable=gwt_var, width=10)
         gwt_entry.grid(row=1, column=1, sticky="w", padx=2, pady=2)
+        ttk.Label(line_frame, text="gr").grid(row=1, column=2, sticky="w")
 
         ttk.Label(line_frame, text="Scrap :").grid(row=2, column=0, sticky="e")
         scrap_entry = ttk.Entry(line_frame, textvariable=scrap_var, width=10)
@@ -2792,11 +2798,13 @@ class StepFrame(ttk.LabelFrame):
         stone_label.grid(row=3, column=0, sticky="e")
         stone_entry = ttk.Entry(line_frame, textvariable=stone_var, width=10)
         stone_entry.grid(row=3, column=1, sticky="w", padx=2, pady=2)
+        ttk.Label(line_frame, text="cts").grid(row=3, column=2, sticky="w")
 
         return_find_label = ttk.Label(line_frame, text="Return Findings :")
         return_find_label.grid(row=4, column=0, sticky="e")
         find_entry = ttk.Entry(line_frame, textvariable=find_var, width=10)
         find_entry.grid(row=4, column=1, sticky="w", padx=2, pady=2)
+        ttk.Label(line_frame, text="gr").grid(row=4, column=2, sticky="w")
 
         ttk.Label(line_frame, text="Description :").grid(row=5, column=0, sticky="e")
         desc_entry = ttk.Entry(line_frame, textvariable=desc_var)
@@ -3246,10 +3254,14 @@ class DetailManageWindow(tk.Toplevel):
         self.geometry("400x300")
 
         ttk.Label(self, text=f"Détails pour {self.display_name}").pack(pady=5)
+        self.unit_suffix = "cts" if self.detail_type in {"stone", "return_stone"} else "gr"
         cols = ("Description", "Pcs", "GWT")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", selectmode="browse")
         for col in cols:
-            self.tree.heading(col, text=col)
+            heading = col
+            if col == "GWT":
+                heading = f"{col} ({self.unit_suffix})"
+            self.tree.heading(col, text=heading)
             self.tree.column(col, anchor="center", minwidth=50, width=120)
         self.tree.pack(fill="both", expand=True, padx=5, pady=5)
         self.tree.bind("<Delete>", self.delete_selected)
